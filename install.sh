@@ -18,7 +18,7 @@ echo
 
 # Deps
 missing=()
-for cmd in jq curl git python3; do
+for cmd in jq curl git; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -26,7 +26,7 @@ if [ ${#missing[@]} -gt 0 ]; then
     echo "  ${d}brew install jq${n}  # if you're on macOS"
     exit 1
 fi
-echo "  ${g}✓${n} Dependencies found (jq, curl, git, python3)"
+echo "  ${g}✓${n} Dependencies found (jq, curl, git)"
 
 mkdir -p "$CLAUDE_DIR"
 

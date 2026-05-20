@@ -16,8 +16,6 @@ if [ -z "$input" ]; then
     exit 0
 fi
 
-# ── Tunables ────────────────────────────────────────────
-MAX_WIDTH=50  # 13" M1 Air, terminal at ~33% screen width
 
 # ── Colors ──────────────────────────────────────────────
 # $'...' interpolates \033 → actual ESC byte (vs literal \033 4-char string).
@@ -113,43 +111,6 @@ iso_to_epoch() {
 # Strip ANSI escape codes to measure visible width.
 strip_ansi() {
     printf "%s" "$1" | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'
-}
-
-# Truncate visible string to MAX_WIDTH terminal cells with trailing …,
-# preserving ANSI codes and counting wide chars (emoji) as 2 cells.
-# Uses python3 (system-shipped on macOS). Falls back to no-truncate if missing.
-truncate_visible() {
-    local s="$1"
-    local maxw=$2
-    if ! command -v python3 >/dev/null 2>&1; then
-        printf "%s" "$s"
-        return
-    fi
-    MAXW="$maxw" RESET_SEQ=$'\033[0m' python3 -c '
-import os, re, sys, unicodedata
-s = sys.stdin.read()
-maxw = int(os.environ["MAXW"])
-reset = os.environ["RESET_SEQ"]
-ansi = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-out, used, i, n = [], 0, 0, len(s)
-def cellw(ch):
-    return 2 if unicodedata.east_asian_width(ch) in ("W","F") else 1
-while i < n:
-    m = ansi.match(s, i)
-    if m:
-        out.append(m.group(0))
-        i = m.end()
-        continue
-    ch = s[i]
-    w = cellw(ch)
-    if used + w > maxw - 1:  # reserve 1 cell for …
-        break
-    out.append(ch); used += w; i += 1
-if i < n:
-    sys.stdout.write("".join(out) + reset + "…")
-else:
-    sys.stdout.write(s)
-' <<< "$s"
 }
 
 # ── Extract stdin JSON ──────────────────────────────────
@@ -346,10 +307,8 @@ if [ -n "$seven_pct" ]; then
     [ -n "$seven_reset_fmt" ] && line2+=" ${dim}⟳${reset} ${white}${seven_reset_fmt}${reset}"
 fi
 
-# ── Output (truncate each line as a whole) ──────────────
-printf "%s" "$(truncate_visible "$line1" "$MAX_WIDTH")"
-if [ -n "$line2" ]; then
-    printf "\n%s" "$(truncate_visible "$line2" "$MAX_WIDTH")"
-fi
+# ── Output ──────────────────────────────────────────────
+printf "%s" "$line1"
+[ -n "$line2" ] && printf "\n%s" "$line2"
 
 exit 0

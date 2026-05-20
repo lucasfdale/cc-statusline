@@ -1,6 +1,6 @@
 # cc-statusline
 
-Minimal Claude Code statusline. Two lines, capped at 50 terminal cells, opinionated for parallel CC sessions on a 13" laptop.
+Minimal Claude Code statusline. Two lines, terminal wraps if it overflows.
 
 Inspired by [nilbuild/claude-statusline](https://github.com/nilbuild/claude-statusline) (MIT).
 
@@ -30,9 +30,6 @@ Opus 4.7 | ✍️ 65% | 🌳 open-signup* ⚑2 | ⏲️ 3h0m
 
 - 5-segment bars, no labels
 - `current` (5-hour) on the left, `weekly` (7-day) on the right
-
-### Truncation
-Either line gets truncated as a whole with `…` when over 50 terminal cells (tuned for ~33% width of a 13" MacBook Air at default scaling). Emojis count as 2 cells.
 
 ### Color thresholds
 - `< 50%` green
@@ -65,7 +62,6 @@ Restores `statusline.sh.bak` if present, otherwise moves the script to Trash. Re
 - `jq` — JSON parsing
 - `curl` — fetching rate-limit data when stdin lacks it
 - `git` — branch / dirty / stash info
-- `python3` — terminal-cell-accurate truncation (ships with macOS)
 
 macOS: `brew install jq` covers the only one that isn't preinstalled.
 
