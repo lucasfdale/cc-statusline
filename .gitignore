@@ -1,0 +1,11 @@
+# macOS noise
+.DS_Store
+*.swp
+*~
+
+# Bak files from local installer testing
+*.bak
+
+# Editor
+.vscode/
+.idea/
