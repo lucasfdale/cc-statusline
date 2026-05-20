@@ -198,8 +198,11 @@ if [ -n "$session_duration" ]; then
 fi
 
 # ── Rate limits ─────────────────────────────────────────
-# Source priority: stdin → cached API response → live API call → cached fallback.
-# (Upstream behavior preserved; single outbound endpoint, no other network use.)
+# Source priority: stdin (utilization) + cache or API (resets_at) → cached fallback.
+# Why two sources: CC sometimes sends .rate_limits.*.used_percentage WITHOUT
+# .resets_at mid-session (utilization is cheap to send every refresh; reset
+# timestamps update periodically). Treat them independently so the timer
+# doesn't disappear when only the percentage refreshes.
 has_stdin_rates=false
 five_pct=""; five_reset_epoch=""
 seven_pct=""; seven_reset_epoch=""
@@ -219,6 +222,25 @@ cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
 mkdir -p /tmp/claude
 usage_data=""
+
+# Backfill resets_at from cache when stdin gave us utilization but no reset times.
+# We do NOT trigger an API call here — reset timestamps are stable through their
+# whole window, so any non-expired cache entry is fine.
+if $has_stdin_rates && { [ -z "$five_reset_epoch" ] || [ -z "$seven_reset_epoch" ]; }; then
+    if [ -f "$cache_file" ]; then
+        cached=$(cat "$cache_file" 2>/dev/null)
+        if [ -n "$cached" ] && echo "$cached" | jq -e . >/dev/null 2>&1; then
+            if [ -z "$five_reset_epoch" ]; then
+                iso=$(echo "$cached" | jq -r '.five_hour.resets_at // empty')
+                five_reset_epoch=$(iso_to_epoch "$iso")
+            fi
+            if [ -z "$seven_reset_epoch" ]; then
+                iso=$(echo "$cached" | jq -r '.seven_day.resets_at // empty')
+                seven_reset_epoch=$(iso_to_epoch "$iso")
+            fi
+        fi
+    fi
+fi
 
 if ! $has_stdin_rates; then
     needs_refresh=true
