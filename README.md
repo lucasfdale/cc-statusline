@@ -23,7 +23,7 @@ Opus 4.7 | ✍️ 65% | 🌳 open-signup* ⚑2 | ⏲️ 3h0m
 - 🏠 in the repo root, 🌳 inside a worktree (`.claude/worktrees/<name>`)
 - Branch shown in the repo root; worktree mode shows the worktree name only (branch is implied)
 - `*` = dirty working tree
-- `⚑N` = stash count, only shown when stashes exist
+- `📚N` = stash count, only shown when stashes exist
 
 ### Line 2 — rate limits
 `5h-bar pct% ⟳ reset | 7d-bar pct% ⟳ reset`

@@ -190,7 +190,7 @@ if $show_branch && [ -n "$git_branch" ]; then
     line1+=" ${green}(${git_branch}${red}${git_dirty}${green})${reset}"
 fi
 if [ "$git_stash_count" -gt 0 ] 2>/dev/null; then
-    line1+=" ${dim}⚑${git_stash_count}${reset}"
+    line1+=" ${dim}📚${git_stash_count}${reset}"
 fi
 if [ -n "$session_duration" ]; then
     line1+="${sep}"
