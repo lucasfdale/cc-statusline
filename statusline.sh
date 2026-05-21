@@ -162,20 +162,64 @@ fi
 [ "$show_branch" = "false" ] && [ -n "$git_dirty" ] && place_name+="*"
 
 # ── Session duration ────────────────────────────────────
+# Source priority:
+#   1. ~/.claude/sessions/<pid>.json `startedAt` looked up by sessionId
+#      (CC's own session registry — authoritative, epoch ms)
+#   2. stdin .session.start_time (older CC versions)
+#   3. mtime of the session JSONL file (last-resort fallback)
 session_duration=""
-session_start=$(echo "$input" | jq -r '.session.start_time // empty')
-if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
-    start_epoch=$(iso_to_epoch "$session_start")
-    if [ -n "$start_epoch" ]; then
-        now_epoch=$(date +%s)
-        elapsed=$(( now_epoch - start_epoch ))
-        if [ "$elapsed" -ge 3600 ]; then
-            session_duration="$(( elapsed / 3600 ))h$(( (elapsed % 3600) / 60 ))m"
-        elif [ "$elapsed" -ge 60 ]; then
-            session_duration="$(( elapsed / 60 ))m"
+start_epoch=""
+
+# Try stdin sessionId first; the field name varies across CC versions.
+session_id=$(echo "$input" | jq -r '.session.id // .sessionId // .session_id // empty')
+
+# (1) Session registry lookup
+if [ -n "$session_id" ] && [ -d "$HOME/.claude/sessions" ]; then
+    # Find the registry file with matching sessionId (one jq pass over all of them)
+    started_ms=$(jq -r --arg sid "$session_id" 'select(.sessionId == $sid) | .startedAt' \
+        "$HOME"/.claude/sessions/*.json 2>/dev/null | head -1)
+    if [ -n "$started_ms" ] && [ "$started_ms" != "null" ]; then
+        start_epoch=$(( started_ms / 1000 ))
+    fi
+fi
+
+# (2) Stdin fallback (legacy)
+if [ -z "$start_epoch" ]; then
+    session_start=$(echo "$input" | jq -r '.session.start_time // .session.startedAt // empty')
+    if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
+        # Pure-digits (no `T`, no `-`, no `:`) = epoch (ms if ≥13 digits, else seconds).
+        # Anything else → treat as ISO 8601.
+        if [[ "$session_start" =~ ^[0-9]+$ ]]; then
+            if [ ${#session_start} -ge 13 ]; then
+                start_epoch=$(( session_start / 1000 ))
+            else
+                start_epoch=$session_start
+            fi
         else
-            session_duration="${elapsed}s"
+            start_epoch=$(iso_to_epoch "$session_start")
         fi
+    fi
+fi
+
+# (3) JSONL mtime fallback
+if [ -z "$start_epoch" ] && [ -n "$session_id" ]; then
+    sanitized=$(echo "$cwd" | sed 's|/|-|g')
+    jsonl="$HOME/.claude/projects/${sanitized}/${session_id}.jsonl"
+    if [ -f "$jsonl" ]; then
+        # Use birth time on macOS (stat -f %B), creation/mtime on Linux fallback
+        start_epoch=$(stat -f %B "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)
+    fi
+fi
+
+if [ -n "$start_epoch" ] && [ "$start_epoch" -gt 0 ] 2>/dev/null; then
+    now_epoch=$(date +%s)
+    elapsed=$(( now_epoch - start_epoch ))
+    if [ "$elapsed" -ge 3600 ]; then
+        session_duration="$(( elapsed / 3600 ))h$(( (elapsed % 3600) / 60 ))m"
+    elif [ "$elapsed" -ge 60 ]; then
+        session_duration="$(( elapsed / 60 ))m"
+    elif [ "$elapsed" -ge 0 ]; then
+        session_duration="${elapsed}s"
     fi
 fi
 
@@ -198,112 +242,91 @@ if [ -n "$session_duration" ]; then
 fi
 
 # ── Rate limits ─────────────────────────────────────────
-# Source priority: stdin (utilization) + cache or API (resets_at) → cached fallback.
-# Why two sources: CC sometimes sends .rate_limits.*.used_percentage WITHOUT
-# .resets_at mid-session (utilization is cheap to send every refresh; reset
-# timestamps update periodically). Treat them independently so the timer
-# doesn't disappear when only the percentage refreshes.
-has_stdin_rates=false
+# Source design:
+#   - Utilization: prefer stdin (freshest per-keystroke).
+#   - Reset timestamps: ALWAYS from the cache, refreshed via the API on TTL miss.
+#     Stdin's resets_at field is unreliable (CC sends it irregularly), and the
+#     cache previously starved when has_stdin_rates locked out refreshes —
+#     reset times went stale for hours. This refresh path is independent of
+#     stdin contents.
 five_pct=""; five_reset_epoch=""
 seven_pct=""; seven_reset_epoch=""
 
 stdin_five=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 if [ -n "$stdin_five" ]; then
-    has_stdin_rates=true
     five_pct=$(printf "%.0f" "$stdin_five")
-    five_reset_iso=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-    five_reset_epoch=$(iso_to_epoch "$five_reset_iso")
     seven_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | awk '{printf "%.0f", $1}')
-    seven_reset_iso=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
-    seven_reset_epoch=$(iso_to_epoch "$seven_reset_iso")
 fi
 
 cache_file="/tmp/claude/statusline-usage-cache.json"
-cache_max_age=60
+cache_max_age=300  # 5min — reset timestamps don't move that fast; saves API hammer
 mkdir -p /tmp/claude
 usage_data=""
+needs_refresh=true
 
-# Backfill resets_at from cache when stdin gave us utilization but no reset times.
-# We do NOT trigger an API call here — reset timestamps are stable through their
-# whole window, so any non-expired cache entry is fine.
-if $has_stdin_rates && { [ -z "$five_reset_epoch" ] || [ -z "$seven_reset_epoch" ]; }; then
-    if [ -f "$cache_file" ]; then
-        cached=$(cat "$cache_file" 2>/dev/null)
-        if [ -n "$cached" ] && echo "$cached" | jq -e . >/dev/null 2>&1; then
-            if [ -z "$five_reset_epoch" ]; then
-                iso=$(echo "$cached" | jq -r '.five_hour.resets_at // empty')
-                five_reset_epoch=$(iso_to_epoch "$iso")
-            fi
-            if [ -z "$seven_reset_epoch" ]; then
-                iso=$(echo "$cached" | jq -r '.seven_day.resets_at // empty')
-                seven_reset_epoch=$(iso_to_epoch "$iso")
-            fi
-        fi
+if [ -f "$cache_file" ]; then
+    cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
+    now=$(date +%s)
+    cache_age=$(( now - cache_mtime ))
+    if [ "$cache_age" -lt "$cache_max_age" ]; then
+        needs_refresh=false
     fi
+    usage_data=$(cat "$cache_file" 2>/dev/null)
 fi
 
-if ! $has_stdin_rates; then
-    needs_refresh=true
-    if [ -f "$cache_file" ]; then
-        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
-        now=$(date +%s)
-        cache_age=$(( now - cache_mtime ))
-        if [ "$cache_age" -lt "$cache_max_age" ]; then
-            needs_refresh=false
-            usage_data=$(cat "$cache_file" 2>/dev/null)
+if $needs_refresh; then
+    token=""
+    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        token="$CLAUDE_CODE_OAUTH_TOKEN"
+    elif command -v security >/dev/null 2>&1; then
+        blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+        if [ -n "$blob" ]; then
+            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
         fi
     fi
-
-    if $needs_refresh; then
-        token=""
-        if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            token="$CLAUDE_CODE_OAUTH_TOKEN"
-        elif command -v security >/dev/null 2>&1; then
-            blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+        creds_file="${HOME}/.claude/.credentials.json"
+        if [ -f "$creds_file" ]; then
+            token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+        fi
+    fi
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+        if command -v secret-tool >/dev/null 2>&1; then
+            blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
             if [ -n "$blob" ]; then
                 token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
             fi
         fi
-        if [ -z "$token" ] || [ "$token" = "null" ]; then
-            creds_file="${HOME}/.claude/.credentials.json"
-            if [ -f "$creds_file" ]; then
-                token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-            fi
-        fi
-        if [ -z "$token" ] || [ "$token" = "null" ]; then
-            if command -v secret-tool >/dev/null 2>&1; then
-                blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
-                if [ -n "$blob" ]; then
-                    token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-                fi
-            fi
-        fi
-
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            response=$(curl -s --max-time 5 \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $token" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                -H "User-Agent: claude-code/2.1.34" \
-                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-            if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
-                usage_data="$response"
-                echo "$response" > "$cache_file"
-            fi
-        fi
-        if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
-            usage_data=$(cat "$cache_file" 2>/dev/null)
-        fi
     fi
 
-    if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
+    if [ -n "$token" ] && [ "$token" != "null" ]; then
+        response=$(curl -s --max-time 5 \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "User-Agent: claude-code/2.1.34" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+        if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
+            usage_data="$response"
+            echo "$response" > "$cache_file"
+        fi
+    fi
+fi
+
+# Pull reset timestamps + utilization-fallback from cache.
+if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
+    five_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
+    five_reset_epoch=$(iso_to_epoch "$five_reset_iso")
+    seven_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
+    seven_reset_epoch=$(iso_to_epoch "$seven_reset_iso")
+
+    # If stdin didn't carry utilization, use cache values.
+    if [ -z "$five_pct" ]; then
         five_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
-        five_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
-        five_reset_epoch=$(iso_to_epoch "$five_reset_iso")
+    fi
+    if [ -z "$seven_pct" ]; then
         seven_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
-        seven_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
-        seven_reset_epoch=$(iso_to_epoch "$seven_reset_iso")
     fi
 fi
 
